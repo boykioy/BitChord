@@ -1,0 +1,97 @@
+name: iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios-shell/**'
+      - '.github/workflows/ios-ipa.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID || 'com.bitchord.ios' }}
+      IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+      IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+      IOS_PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build the web app
+        run: |
+          corepack enable
+          corepack pnpm --dir web install --frozen-lockfile
+          corepack pnpm --dir web/app exec vite build
+
+      - name: Stage the web build into the iOS shell
+        run: |
+          rm -rf ios-shell/www
+          cp -R web/app/dist ios-shell/www
+          if [ -f Logo.png ]; then
+            sips -s format png -z 1024 1024 Logo.png --out ios-shell/Assets.xcassets/AppIcon.appiconset/icon.png
+          fi
+
+      - name: Generate the Xcode project
+        working-directory: ios-shell
+        run: |
+          brew install xcodegen
+          sed -i '' "s/com\.bitchord\.ios/${BUNDLE_ID}/" project.yml
+          xcodegen generate
+
+      - name: Build (unsigned)
+        working-directory: ios-shell
+        run: |
+          xcodebuild -project BitChord.xcodeproj -scheme BitChord \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tail -n 60
+
+      - name: Package unsigned IPA
+        working-directory: ios-shell
+        run: |
+          rm -rf Payload && mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/BitChord.app Payload/
+          zip -qry ../BitChord-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BitChord-unsigned-ipa
+          path: BitChord-unsigned.ipa
+
+      # Optional: runs only when you add the three signing secrets.
+      - name: Sign IPA with your certificate
+        if: env.IOS_CERT_P12_BASE64 != ''
+        working-directory: ios-shell
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/bc.keychain-db"
+          security create-keychain -p "" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "" "$KEYCHAIN"
+          echo "$IOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$IOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          echo "$IOS_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$RUNNER_TEMP/profile.plist" > "$RUNNER_TEMP/entitlements.plist"
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | head -1 | awk '{print $2}')
+          rm -rf signed && mkdir -p signed/Payload
+          cp -R Payload/BitChord.app signed/Payload/
+          cp "$RUNNER_TEMP/profile.mobileprovision" signed/Payload/BitChord.app/embedded.mobileprovision
+          codesign --force --sign "$IDENTITY" --entitlements "$RUNNER_TEMP/entitlements.plist" --timestamp=none signed/Payload/BitChord.app
+          (cd signed && zip -qry ../../BitChord-signed.ipa Payload)
+
+      - uses: actions/upload-artifact@v4
+        if: env.IOS_CERT_P12_BASE64 != ''
+        with:
+          name: BitChord-signed-ipa
+          path: BitChord-signed.ipa
